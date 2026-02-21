@@ -117,3 +117,6 @@ async def set_webhook(req: Request):
     url = str(req.base_url).rstrip("/") + f"/webhook/{WEBHOOK_SECRET}"
     await tg_app.bot.set_webhook(url)
     return {"webhook_set": True}
+@app.get("/")
+async def root():
+    return {"status": "running"}
