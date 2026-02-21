@@ -55,11 +55,14 @@ def compute(csv_bytes):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Weekly steps:\n"
-        "1) /players AIDN015 AIDN042\n"
-        "2) Send CSV\n"
-        "Bot returns totals and free play"
+        say(
+            "Weekly steps:\n"
+            "1) /players AIDN015 AIDN042\n"
+            "2) send the CSV or Excel report\n"
+            "I’ll return totals and free play."
+        )
     )
 
 
