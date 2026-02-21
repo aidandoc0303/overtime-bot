@@ -14,6 +14,8 @@ tg_app = None
 LATEST_CSV = None
 CURRENT_GROUP = []
 
+def say(text: str) -> str:
+    return f"Yes sir — {text}"
 
 def parse_money(x):
     s = str(x).replace("$", "").replace(",", "").strip()
@@ -24,7 +26,11 @@ def parse_money(x):
 
 
 def compute(csv_bytes):
-    df = pd.read_csv(io.BytesIO(csv_bytes))
+    def compute(file_bytes, filename):
+    if filename.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(file_bytes))
+    else:
+        df = pd.read_excel(io.BytesIO(file_bytes))
     username_col = df.columns[0]
     balance_col = df.columns[-1]
 
@@ -64,21 +70,23 @@ async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     CURRENT_GROUP = context.args
-    await update.message.reply_text("Players saved:\n" + "\n".join(CURRENT_GROUP))
+    await update.message.reply_text(say("Players saved:\n" + "\n".join(CURRENT_GROUP)))
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LATEST_CSV
 
-    if not update.message.document.file_name.lower().endswith(".csv"):
-        await update.message.reply_text("Please send a CSV file.")
-        return
+  filename = update.message.document.file_name.lower()
+
+if not (filename.endswith(".csv") or filename.endswith(".xlsx") or filename.endswith(".xls")):
+    await update.message.reply_text("Please send a CSV or Excel file.")
+    return
 
     file = await update.message.document.get_file()
     data = await file.download_as_bytearray()
     LATEST_CSV = bytes(data)
 
-    total, freeplay, breakdown = compute(LATEST_CSV)
+    total, freeplay, breakdown = compute(LATEST_CSV, filename)
 
     msg = f"Group Total: {total:,.2f}\n"
     msg += f"20% Free Play (≤ -100): ${freeplay}\n\n"
