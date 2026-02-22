@@ -50,14 +50,20 @@ def say(text: str) -> str:
 
 
 def parse_money(x) -> Optional[float]:
+    # If it's already a number (Excel often sends floats), just return it
+    if isinstance(x, (int, float)):
+        return float(x)
+
     if x is None:
         return None
+
     s = str(x).replace("$", "").replace(",", "").strip()
-    if s == "" or s.lower() in ["nan", "none"]:
+    if s == "" or s.lower() == "nan":
         return None
+
     try:
         return float(s)
-    except Exception:
+    except:
         return None
 
 
