@@ -176,10 +176,13 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(say("Set players first: /players AIDN015 AIDN042"))
         return
 
-    # Preferred: pull from site if REPORT_URL is set
-    if REPORT_URL:
-        try:
-            LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
+    # If no file uploaded yet, try pulling from site
+if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
+    try:
+        LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
+        return
         except Exception as e:
             await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
             return
