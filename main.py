@@ -9,25 +9,23 @@ from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Optional AI (hybrid): only used when a message starts with "Kenobi ..."
+# Optional AI (hybrid)
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
 
-# ====== ENV VARS ======
+# ====== ENV ======
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# Optional: site pull (Path A)
-REPORT_URL = os.getenv("REPORT_URL")  # direct download URL to report (csv/xls/xlsx)
-REPORT_BEARER_TOKEN = os.getenv("REPORT_BEARER_TOKEN")  # optional
-REPORT_USER = os.getenv("REPORT_USER")  # optional
-REPORT_PASS = os.getenv("REPORT_PASS")  # optional
-REPORT_COOKIE = os.getenv("REPORT_COOKIE")  # optional (raw Cookie header string)
+REPORT_URL = os.getenv("REPORT_URL")
+REPORT_BEARER_TOKEN = os.getenv("REPORT_BEARER_TOKEN")
+REPORT_USER = os.getenv("REPORT_USER")
+REPORT_PASS = os.getenv("REPORT_PASS")
+REPORT_COOKIE = os.getenv("REPORT_COOKIE")
 
-# Optional: AI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 
@@ -46,7 +44,6 @@ oa_client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else N
 
 # ====== HELPERS ======
 def say(text: str) -> str:
-    # Kenobi’s voice
     return f"Yes sir — {text}"
 
 
@@ -54,13 +51,12 @@ def parse_money(x) -> Optional[float]:
     s = str(x).replace("$", "").replace(",", "").strip()
     try:
         return float(s)
-    except Exception:
+    except:
         return None
 
 
 def extract_ids(text: str) -> List[str]:
-    # Matches AIDN015 style (letters+digits)
-    return re.findall(r"\b[A-Z]{2,}\d{2,}\b", (text or "").upper())
+    return re.findall(r"\b[A-Z]{2,}\d{2,}\b", text.upper())
 
 
 def pick_col(cols, options):
@@ -70,16 +66,15 @@ def pick_col(cols, options):
     return None
 
 
+# ====== CORE LOGIC ======
 def compute(file_bytes, filename, current_group):
-    # Read file
-    if filename.endswith(".csv"):
+    if filename.lower().endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes))
     else:
         df = pd.read_excel(io.BytesIO(file_bytes))
 
-    # Detect columns
     user_col = pick_col(df.columns, ["CustomerId", "Customer", "Username"])
-    bal_col  = pick_col(df.columns, ["C. Balance", "Balance"])
+    bal_col = pick_col(df.columns, ["C. Balance", "Balance"])
 
     if user_col is None or bal_col is None:
         return None, None, None, "Missing CustomerId or Balance column"
@@ -87,12 +82,12 @@ def compute(file_bytes, filename, current_group):
     df["_u"] = df[user_col].astype(str).str.strip().str.lower()
     df["_b"] = df[bal_col].apply(parse_money)
 
-    # -------- Group total (selected players only) --------
+    # ===== GROUP TOTAL (selected only) =====
     selected = [u.lower() for u in current_group]
     sub = df[df["_u"].isin(selected)]
     group_total = float(sub["_b"].fillna(0).sum())
 
-    # -------- Free play (ALL players) --------
+    # ===== FREE PLAY (all players) =====
     freeplay_total = 0
     breakdown = []
 
@@ -106,13 +101,10 @@ def compute(file_bytes, filename, current_group):
     return group_total, freeplay_total, breakdown, None
 
 
+# ====== REPORT PULL (optional) ======
 async def fetch_report_bytes() -> Tuple[bytes, str]:
-    """
-    Pulls report from REPORT_URL (Path A).
-    Supports optional bearer token, basic auth, or cookie header.
-    """
     if not REPORT_URL:
-        raise RuntimeError("REPORT_URL is not set")
+        raise RuntimeError("REPORT_URL not set")
 
     headers = {}
     if REPORT_BEARER_TOKEN:
@@ -128,74 +120,62 @@ async def fetch_report_bytes() -> Tuple[bytes, str]:
         r = await client.get(REPORT_URL, headers=headers, auth=auth)
         r.raise_for_status()
 
-        # Try infer filename
         filename = "weekly_report.xlsx"
-        cd = r.headers.get("content-disposition", "") or ""
-        if "filename=" in cd.lower():
-            # crude parse, works for most
-            part = cd.split("filename=")[-1].strip()
-            filename = part.strip('"').strip("'")
-        else:
-            url_low = REPORT_URL.lower()
-            if ".csv" in url_low:
-                filename = "weekly_report.csv"
-            elif ".xlsx" in url_low:
-                filename = "weekly_report.xlsx"
-            elif ".xls" in url_low:
-                filename = "weekly_report.xls"
+        if ".csv" in REPORT_URL.lower():
+            filename = "weekly_report.csv"
 
         return r.content, filename
 
 
-# ====== TELEGRAM HANDLERS ======
+# ====== TELEGRAM ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         say(
-            "Here’s how to use me:\n"
-            "1) Set players: /players AIDN015 AIDN042\n"
-            "2) Either upload the report file (CSV/XLS/XLSX) OR just run /weekly if REPORT_URL is configured\n"
-            "3) /weekly returns group total + 20% free play owed list"
+            "How to use:\n"
+            "1) /players AIDN003 AIDN014\n"
+            "2) Upload report OR say weekly report\n"
+            "I’ll return totals and free play."
         )
     )
 
 
 async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CURRENT_GROUP
+
     if not context.args:
-        await update.message.reply_text(say("Usage: /players AIDN015 AIDN042"))
+        await update.message.reply_text(say("Usage: /players AIDN003 AIDN014"))
         return
 
     CURRENT_GROUP = context.args
-    await update.message.reply_text(say("Players saved:\n" + "\n".join(CURRENT_GROUP)))
+    await update.message.reply_text(
+        say("Players saved:\n" + "\n".join(CURRENT_GROUP))
+    )
 
 
 async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LATEST_FILE_BYTES, LATEST_FILE_NAME
 
     if not CURRENT_GROUP:
-        await update.message.reply_text(say("Set players first: /players AIDN015 AIDN042"))
+        await update.message.reply_text(say("Set players first"))
         return
 
-    # If no file uploaded yet, try pulling from site
+    # Try site pull if no upload yet
     if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
         try:
             LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
         except Exception as e:
-            await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
+            await update.message.reply_text(say(f"Site pull failed: {e}"))
             return
 
-    # Fallback: use last uploaded
-    if not LATEST_FILE_BYTES or not LATEST_FILE_NAME:
-        await update.message.reply_text(
-            say("Send the report file first (CSV/XLS/XLSX), or set REPORT_URL on Render.")
-        )
+    if not LATEST_FILE_BYTES:
+        await update.message.reply_text(say("Send the report file first"))
         return
 
-    try:
-        total, freeplay, breakdown, err = compute(LATEST_FILE_BYTES, LATEST_FILE_NAME, CURRENT_GROUP)
-    except Exception as e:
-        await update.message.reply_text(say(f"Couldn’t read that report: {e}"))
-        return
+    total, freeplay, breakdown, err = compute(
+        LATEST_FILE_BYTES,
+        LATEST_FILE_NAME,
+        CURRENT_GROUP
+    )
 
     if err:
         await update.message.reply_text(say(err))
@@ -203,30 +183,25 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = "Weekly Report\n\n"
     msg += f"Group Total: {total:,.2f}\n"
-    msg += f"20% Free Play (balances ≤ -100): ${freeplay}\n\n"
+    msg += f"20% Free Play Total: ${freeplay}\n\n"
 
     if breakdown:
         msg += "Free Play Owed:\n"
         for u, b, fp in breakdown:
             msg += f"{str(u).upper()}: {b:,.2f} → ${fp}\n"
     else:
-        msg += "No accounts qualify for free play (≤ -100)."
+        msg += "No players ≤ -100"
 
-    await update.message.reply_text(say("\n" + msg))
+    await update.message.reply_text(say(msg))
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LATEST_FILE_BYTES, LATEST_FILE_NAME
 
-    if not update.message or not update.message.document:
-        await update.message.reply_text(say("Attach a report file (CSV/XLS/XLSX)."))
-        return
+    filename = (update.message.document.file_name or "").lower()
 
-    filename = (update.message.document.file_name or "").strip()
-    low = filename.lower()
-
-    if not (low.endswith(".csv") or low.endswith(".xlsx") or low.endswith(".xls")):
-        await update.message.reply_text(say("Please send a CSV or Excel file (.csv, .xlsx, .xls)."))
+    if not filename.endswith((".csv", ".xlsx", ".xls")):
+        await update.message.reply_text(say("Send CSV or Excel"))
         return
 
     f = await update.message.document.get_file()
@@ -235,73 +210,48 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     LATEST_FILE_BYTES = bytes(data)
     LATEST_FILE_NAME = filename
 
-    # Nice UX: auto-run weekly right after upload
-    await update.message.reply_text(say("Report received. Running weekly report now..."))
+    await update.message.reply_text(say("Report received"))
     await weekly(update, context)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text_raw = (update.message.text or "").strip()
-    text = text_raw.lower()
+    text = (update.message.text or "").strip().lower()
 
-    # Paid AI trigger (hybrid): must start with "Kenobi"
+    # Paid AI
     if text.startswith("kenobi"):
         if not oa_client:
-            await update.message.reply_text(say("AI isn’t configured yet. Add OPENAI_API_KEY on Render."))
+            await update.message.reply_text(say("AI not configured"))
             return
 
-        prompt = text_raw[len("kenobi"):].strip()
-        if not prompt:
-            await update.message.reply_text(say("What should I help with? Example: Kenobi summarize this week"))
-            return
+        prompt = text[6:].strip()
 
-        try:
-            resp = oa_client.responses.create(
-                model="gpt-5-mini",
-                input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are Kenobi, a calm and practical assistant. "
-                            "Always address the user as 'sir'. Keep replies concise."
-                        ),
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            await update.message.reply_text(resp.output_text)
-        except Exception as e:
-            await update.message.reply_text(say(f"AI error: {e}"))
+        resp = oa_client.responses.create(
+            model="gpt-5-mini",
+            input=prompt
+        )
+
+        await update.message.reply_text(resp.output_text)
         return
 
-    # Free English-ish intents
-    if any(p in text for p in ["weekly report", "send weekly report", "run weekly", "weekly totals", "/weekly"]):
+    # Free commands
+    if "weekly" in text:
         return await weekly(update, context)
 
-    if text.startswith("players") or text.startswith("set players"):
-        ids = extract_ids(text_raw)
-        if not ids:
-            await update.message.reply_text(say("Tell me IDs like: players AIDN015 AIDN042"))
-            return
+    if "players" in text:
+        ids = extract_ids(text)
         context.args = ids
         return await players(update, context)
 
-    if any(p in text for p in ["help", "instructions", "what do i do", "how do i use"]):
-        return await start(update, context)
-
-    await update.message.reply_text(say("Try: ‘weekly report’ or ‘players AIDN015 AIDN042’."))
+    await update.message.reply_text(say("Try: weekly report"))
 
 
-# ====== FASTAPI LIFECYCLE + WEBHOOK ======
+# ====== STARTUP ======
 @app.on_event("startup")
 async def startup():
     global tg_app
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
-    if not WEBHOOK_SECRET:
-        raise RuntimeError("WEBHOOK_SECRET is missing")
 
     tg_app = Application.builder().token(BOT_TOKEN).build()
+
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("players", players))
     tg_app.add_handler(CommandHandler("weekly", weekly))
@@ -315,8 +265,6 @@ async def startup():
 
 @app.post(f"/webhook/{WEBHOOK_SECRET}")
 async def webhook(req: Request):
-    if not tg_app:
-        return {"ok": False, "error": "tg_app not ready"}
     data = await req.json()
     update = Update.de_json(data, tg_app.bot)
     await tg_app.process_update(update)
@@ -325,11 +273,9 @@ async def webhook(req: Request):
 
 @app.get("/setwebhook")
 async def set_webhook(request: Request):
-    # call once after deploy (or anytime after) to set Telegram -> Render webhook
-    assert tg_app is not None
     url = str(request.base_url).rstrip("/") + f"/webhook/{WEBHOOK_SECRET}"
     await tg_app.bot.set_webhook(url)
-    return {"webhook_set": True, "url": url}
+    return {"webhook_set": True}
 
 
 @app.get("/")
