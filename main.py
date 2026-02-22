@@ -190,10 +190,14 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        total, freeplay, breakdown = compute(LATEST_FILE_BYTES, LATEST_FILE_NAME)
+        total, freeplay, breakdown, err = compute(LATEST_FILE_BYTES, LATEST_FILE_NAME, CURRENT_GROUP)
     except Exception as e:
         await update.message.reply_text(say(f"Couldn’t read that report: {e}"))
         return
+
+    if err:
+    await update.message.reply_text(say(err))
+    return
 
     msg = "Weekly Report\n\n"
     msg += f"Group Total: {total:,.2f}\n"
