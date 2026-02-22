@@ -48,11 +48,29 @@ def say(text: str) -> str:
 
 
 def parse_money(x) -> Optional[float]:
-    s = str(x).replace("$", "").replace(",", "").strip()
-    try:
-        return float(s)
-    except:
+    if x is None:
         return None
+
+    s = str(x).strip()
+    if s == "" or s.lower() == "nan":
+        return None
+
+    # Handle parentheses negatives like (123.45)
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1].strip()
+
+    # Remove common junk
+    s = s.replace("$", "").replace(",", "").strip()
+
+    # Extract first number from strings like "-25.00 USD"
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+
+    val = float(m.group(0))
+    return -abs(val) if neg else val
 
 
 def extract_ids(text: str) -> List[str]:
