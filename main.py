@@ -63,46 +63,47 @@ def extract_ids(text: str) -> List[str]:
     return re.findall(r"\b[A-Z]{2,}\d{2,}\b", (text or "").upper())
 
 
-def compute(file_bytes: bytes, filename: str) -> Tuple[float, int, List[Tuple[str, float, int]]]:
-    """
-    Returns:
-      total_balance (float)
-      freeplay_total (int dollars, rounded)
-      breakdown list of (username_lower, balance, freeplay)
-    """
-    name = (filename or "").lower().strip()
+def pick_col(cols, options):
+    for c in cols:
+        if c.strip().lower() in [o.lower() for o in options]:
+            return c
+    return None
 
-    if name.endswith(".csv"):
+
+def compute(file_bytes, filename, current_group):
+    # Read file
+    if filename.endswith(".csv"):
         df = pd.read_csv(io.BytesIO(file_bytes))
-    elif name.endswith(".xlsx") or name.endswith(".xls"):
-        df = pd.read_excel(io.BytesIO(file_bytes))
     else:
-        raise ValueError("Unsupported file type. Send .csv, .xls, or .xlsx")
+        df = pd.read_excel(io.BytesIO(file_bytes))
 
-    if df is None or df.empty or len(df.columns) < 2:
-        raise ValueError("Report file looks empty or missing columns")
+    # Detect columns
+    user_col = pick_col(df.columns, ["CustomerId", "Customer", "Username"])
+    bal_col  = pick_col(df.columns, ["C. Balance", "Balance"])
 
-    username_col = df.columns[0]
-    balance_col = df.columns[-1]
+    if user_col is None or bal_col is None:
+        return None, None, None, "Missing CustomerId or Balance column"
 
-    df["_u"] = df[username_col].astype(str).str.strip().str.lower()
-    df["_b"] = df[balance_col].apply(parse_money)
+    df["_u"] = df[user_col].astype(str).str.strip().str.lower()
+    df["_b"] = df[bal_col].apply(parse_money)
 
-    group_lower = [u.strip().lower() for u in CURRENT_GROUP]
-    sub = df[df["_u"].isin(group_lower)]
+    # -------- Group total (selected players only) --------
+    selected = [u.lower() for u in current_group]
+    sub = df[df["_u"].isin(selected)]
+    group_total = float(sub["_b"].fillna(0).sum())
 
-    total = float(sub["_b"].sum())
-
+    # -------- Free play (ALL players) --------
     freeplay_total = 0
-    breakdown: List[Tuple[str, float, int]] = []
-    for _, r in sub.iterrows():
+    breakdown = []
+
+    for _, r in df.iterrows():
         bal = r["_b"]
         if bal is not None and bal <= -100:
-            fp = round(abs(float(bal)) * 0.20)
+            fp = round(abs(bal) * 0.20)
             freeplay_total += fp
-            breakdown.append((str(r["_u"]), float(bal), int(fp)))
+            breakdown.append((r[user_col], bal, fp))
 
-    return total, freeplay_total, breakdown
+    return group_total, freeplay_total, breakdown, None
 
 
 async def fetch_report_bytes() -> Tuple[bytes, str]:
