@@ -1,7 +1,7 @@
 import os
 import io
 import re
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
 import httpx
@@ -30,6 +30,10 @@ REPORT_COOKIE = os.getenv("REPORT_COOKIE")  # optional (raw Cookie header string
 # Optional: AI
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Option B (persistent names): Upstash Redis REST
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
+
 
 # ====== APP STATE ======
 app = FastAPI()
@@ -40,6 +44,78 @@ LATEST_FILE_NAME: Optional[str] = None
 CURRENT_GROUP: List[str] = []
 
 
+# ====== PLAYER NAME MAP (fallback) ======
+PLAYER_NAMES: Dict[str, str] = {
+    "AIDN001": "Austin",
+    "AIDN002": "Anthony Cancro",
+    "AIDN003": "Blake",
+    "AIDN004": "Charlie",
+    "AIDN005": "Chris",
+    "AIDN006": "Colby",
+    "AIDN007": "Colin",
+    "AIDN008": "Jonny",
+    "AIDN009": "Miles",
+    "AIDN010": "Liam",
+    "AIDN011": "Nick",
+    "AIDN012": "Ryan",
+    "AIDN013": "Oliver",
+    "AIDN014": "John",
+    "AIDN015": "Nooch",
+    "AIDN016": "Spencer",
+    "AIDN017": "Ian",
+    "AIDN018": "Beckett",
+    "AIDN019": "Aston",
+    "AIDN020": "Liam",
+    "AIDN021": "Mason",
+    "AIDN022": "Jake",
+    "AIDN023": "Blake",
+    "AIDN024": "Anthony",
+    "AIDN025": "Max",
+    "AIDN026": "Ben",
+    "AIDN027": "Jake",
+    "AIDN028": "Coby",
+    "AIDN029": "Jake",
+    "AIDN030": "Mark",
+    "AIDN031": "Nick",
+    "AIDN032": "Owen",
+    "AIDN033": "Carter",
+    "AIDN034": "Beckett",
+    "AIDN035": "Mason",
+    "AIDN036": "Ian",
+    "AIDN037": "Andrew",
+    "AIDN038": "Robbie",
+    "AIDN039": "Mason",
+    "AIDN040": "Brody",
+    "AIDN041": "Luke",
+    "AIDN042": "Casey Gilford",
+    "AIDN043": "Reid",
+    "AIDN044": "Anthony Labin",
+    "AIDN045": "Jack Bradford",
+    "AIDN046": "Jon Boyd",
+    "AIDN047": "Blake Peterson",
+    "AIDN048": "Seamus Pinkerton",
+    "AIDN049": "Gavin Feulner",
+    "AIDN050": "Andrew Byrne",
+    "AIDN051": "Mason Diltz",
+    "AIDN052": "Jason Coury",
+    "AIDN053": "Diego Yanez",
+    "AIDN054": "Brian Christy",
+    "AIDN055": "Luke Angelo",
+    "AIDN056": "Kevin Mcdonald",
+    "AIDN057": "Alex Komorowski",
+    "AIDN058": "Enzo Ferrero",
+    "AIDN059": "Corey Gilford",
+    "AIDN060": "Alex Senyk",
+    "AIDN061": "Jamie Petrone",
+    "AIDN062": "Davis Ozerkis",
+    "AIDN063": "Jackson Folvik",
+    "AIDN064": "Jackson Skawinski",
+}
+
+# Upstash keys prefix (so you can share Redis with other stuff)
+NAME_KEY_PREFIX = "kenobi:name:"
+
+
 # ====== AI CLIENT ======
 oa_client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else None
 
@@ -47,6 +123,14 @@ oa_client = OpenAI(api_key=OPENAI_API_KEY) if (OpenAI and OPENAI_API_KEY) else N
 # ====== HELPERS ======
 def say(text: str) -> str:
     return f"Yes sir — {text}"
+
+
+def normalize_id(x: str) -> str:
+    return str(x or "").strip().upper()
+
+
+def extract_ids(text: str) -> List[str]:
+    return re.findall(r"\b[A-Z]{2,}\d{2,}\b", (text or "").upper())
 
 
 def parse_money(x) -> Optional[float]:
@@ -72,31 +156,25 @@ def parse_money(x) -> Optional[float]:
         return None
 
 
-def extract_ids(text: str) -> List[str]:
-    return re.findall(r"\b[A-Z]{2,}\d{2,}\b", (text or "").upper())
-
-
 def normalize_col_name(x) -> str:
     return re.sub(r"\s+", " ", str(x or "")).strip().lower()
 
 
 def find_header_row(df_raw: pd.DataFrame, required_headers: List[str], search_rows: int = 30) -> Optional[int]:
-    """
-    df_raw is header=None dataframe.
-    Finds a row index where required header(s) appear (case-insensitive).
-    """
     req = [h.lower() for h in required_headers]
     max_r = min(search_rows, len(df_raw))
+
     for r in range(max_r):
         row_vals = [normalize_col_name(v) for v in df_raw.iloc[r].tolist()]
-        # if any required header is in that row
         if all(any(h == cell for cell in row_vals) for h in req):
             return r
+
     # fallback: allow partial match (CustomerId alone)
     for r in range(max_r):
         row_vals = [normalize_col_name(v) for v in df_raw.iloc[r].tolist()]
         if any("customerid" == cell for cell in row_vals):
             return r
+
     return None
 
 
@@ -104,47 +182,166 @@ def load_report_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     low = filename.lower()
 
     if low.endswith(".csv"):
-        # CSV usually already has headers, but we still guard
-        df = pd.read_csv(io.BytesIO(file_bytes))
-        return df
+        return pd.read_csv(io.BytesIO(file_bytes))
 
     # Excel: read with header=None first so we can locate the true header row
     df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine="openpyxl")
 
     header_row = find_header_row(df_raw, required_headers=["CustomerId", "C. Balance"])
     if header_row is None:
-        # If we can't find it, try the first row as header as a last resort
-        df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
-        return df
+        # last resort: try pandas normal header parse
+        return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
 
     headers = df_raw.iloc[header_row].tolist()
     df = df_raw.iloc[header_row + 1 :].copy()
     df.columns = headers
     df = df.reset_index(drop=True)
-
-    # Drop completely empty rows
-    df = df.dropna(how="all")
+    df = df.dropna(how="all")  # Drop completely empty rows
     return df
 
 
+# ====== UPSTASH NAME STORAGE (OPTION B) ======
+def upstash_enabled() -> bool:
+    return bool(UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN)
+
+
+async def upstash_call(path: str, method: str = "GET", body: Optional[str] = None, params: Optional[Dict[str, str]] = None) -> Any:
+    """
+    Upstash REST API: command + args are path segments, like:
+      GET  /GET/key
+      POST /SET/key   with body = value
+      GET  /DEL/key
+      GET  /SCAN/0/MATCH/pattern/COUNT/100
+    """
+    if not upstash_enabled():
+        raise RuntimeError("Upstash is not configured (missing UPSTASH_REDIS_REST_URL/TOKEN)")
+
+    url = UPSTASH_REDIS_REST_URL.rstrip("/") + "/" + path.lstrip("/")
+    headers = {"Authorization": f"Bearer {UPSTASH_REDIS_REST_TOKEN}"}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        if method.upper() == "POST":
+            r = await client.post(url, headers=headers, content=(body or ""), params=params)
+        else:
+            r = await client.get(url, headers=headers, params=params)
+
+        r.raise_for_status()
+        return r.json()
+
+
+async def name_get(uid: str) -> Optional[str]:
+    uid = normalize_id(uid)
+    # Upstash
+    if upstash_enabled():
+        try:
+            data = await upstash_call(f"GET/{NAME_KEY_PREFIX}{uid}", method="GET")
+            # {"result": "..."} or {"result": None}
+            val = data.get("result")
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        except Exception:
+            # If Upstash hiccups, fall back to local
+            pass
+
+    # Fallback
+    return PLAYER_NAMES.get(uid)
+
+
+async def name_set(uid: str, name: str) -> None:
+    uid = normalize_id(uid)
+    nm = str(name or "").strip()
+    if not nm:
+        raise ValueError("Name is empty")
+
+    # Update fallback map in-memory too
+    PLAYER_NAMES[uid] = nm
+
+    if upstash_enabled():
+        # POST /SET/<key>  body=value
+        await upstash_call(f"SET/{NAME_KEY_PREFIX}{uid}", method="POST", body=nm)
+
+
+async def name_del(uid: str) -> None:
+    uid = normalize_id(uid)
+    # Remove local override
+    if uid in PLAYER_NAMES:
+        # Keep your built-in list? If you want delete to truly remove,
+        # we’ll delete from local map too.
+        del PLAYER_NAMES[uid]
+
+    if upstash_enabled():
+        await upstash_call(f"DEL/{NAME_KEY_PREFIX}{uid}", method="GET")
+
+
+async def names_list(limit: int = 500) -> Dict[str, str]:
+    """
+    Lists names stored in Upstash under the prefix.
+    Falls back to local PLAYER_NAMES if Upstash not set.
+    """
+    if not upstash_enabled():
+        # Return local snapshot
+        return dict(sorted(PLAYER_NAMES.items()))
+
+    # Use SCAN to find matching keys
+    cursor = "0"
+    found: Dict[str, str] = {}
+
+    # prevent runaway loops
+    for _ in range(20):
+        data = await upstash_call(f"SCAN/{cursor}/MATCH/{NAME_KEY_PREFIX}*/COUNT/200", method="GET")
+        res = data.get("result")
+
+        # Upstash returns something like: ["0", ["k1","k2"]]
+        if isinstance(res, list) and len(res) == 2:
+            cursor = str(res[0])
+            keys = res[1] if isinstance(res[1], list) else []
+        else:
+            break
+
+        for k in keys:
+            if not isinstance(k, str):
+                continue
+            uid = k.replace(NAME_KEY_PREFIX, "").strip()
+            nm = await name_get(uid)
+            if nm:
+                found[normalize_id(uid)] = nm
+            if len(found) >= limit:
+                return dict(sorted(found.items()))
+
+        if cursor == "0":
+            break
+
+    return dict(sorted(found.items()))
+
+
+async def format_player(user_id: str) -> str:
+    uid = normalize_id(user_id)
+    nm = await name_get(uid)
+    return f"{uid} ({nm})" if nm else uid
+
+
+# ====== CORE COMPUTE ======
 def compute(file_bytes: bytes, filename: str, current_group: List[str]):
     df = load_report_table(file_bytes, filename)
 
-    # normalize column names lookup
     col_map = {normalize_col_name(c): c for c in df.columns}
 
-    # expected columns in YOUR file
     user_col = col_map.get("customerid") or col_map.get("customer id")
-    bal_col = col_map.get("c. balance") or col_map.get("c.balance") or col_map.get("balance") or col_map.get("c balance")
+    bal_col = (
+        col_map.get("c. balance")
+        or col_map.get("c.balance")
+        or col_map.get("c balance")
+        or col_map.get("balance")
+    )
 
     if not user_col or not bal_col:
         return None, None, None, "Missing CustomerId or C. Balance column"
 
-    df["_u"] = df[user_col].astype(str).str.strip().str.lower()
+    df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money)
 
     # ---- Group total (selected players only) ----
-    selected = [u.strip().lower() for u in current_group]
+    selected = [normalize_id(u) for u in current_group]
     sub = df[df["_u"].isin(selected)]
     group_total = float(sub["_b"].fillna(0).sum())
 
@@ -159,6 +356,48 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
             breakdown.append((str(r[user_col]).strip(), float(bal), fp))
 
     return group_total, freeplay_total, breakdown, None
+
+
+def compute_settle_lists(file_bytes: bytes, filename: str):
+    df = load_report_table(file_bytes, filename)
+    col_map = {normalize_col_name(c): c for c in df.columns}
+    user_col = col_map.get("customerid") or col_map.get("customer id")
+    bal_col = (
+        col_map.get("c. balance")
+        or col_map.get("c.balance")
+        or col_map.get("c balance")
+        or col_map.get("balance")
+    )
+    if not user_col or not bal_col:
+        return None, None, "Missing CustomerId or C. Balance column"
+
+    df["_u"] = df[user_col].astype(str).str.strip().str.upper()
+    df["_b"] = df[bal_col].apply(parse_money).fillna(0)
+
+    winners = []
+    losers = []
+    for _, r in df.iterrows():
+        uid = str(r[user_col]).strip().upper()
+        bal = float(r["_b"])
+        if bal > 0:
+            winners.append((uid, bal))
+        elif bal < 0:
+            losers.append((uid, bal))
+
+    winners.sort(key=lambda x: x[1], reverse=True)
+    losers.sort(key=lambda x: x[1])  # most negative first
+
+    total_winners = sum(x[1] for x in winners)
+    total_losers_abs = sum(abs(x[1]) for x in losers)
+    net = total_winners - total_losers_abs
+
+    return {
+        "winners": winners,
+        "losers": losers,
+        "total_winners": total_winners,
+        "total_losers_abs": total_losers_abs,
+        "net": net,
+    }, None, None
 
 
 async def fetch_report_bytes() -> Tuple[bytes, str]:
@@ -203,7 +442,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "How to use:\n"
             "1) /players AIDN003 AIDN014\n"
             "2) Upload report (CSV/XLS/XLSX) OR run /weekly if REPORT_URL is set\n"
-            "3) Say 'weekly report' anytime to run it\n\n"
+            "3) Say 'weekly report' anytime\n\n"
+            "Names:\n"
+            "  /name AIDN003 Blake\n"
+            "  /name_get AIDN003\n"
+            "  /name_del AIDN003\n"
+            "  /names\n\n"
+            "Settles:\n"
+            "  /settle (splits winners vs losers)\n\n"
             "AI only triggers if you type: Kenobi <message>"
         )
     )
@@ -215,8 +461,9 @@ async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(say("Usage: /players AIDN015 AIDN042"))
         return
 
-    CURRENT_GROUP = context.args
-    await update.message.reply_text(say("Players saved:\n" + "\n".join(CURRENT_GROUP)))
+    CURRENT_GROUP = [normalize_id(a) for a in context.args if str(a).strip()]
+    lines = [await format_player(pid) for pid in CURRENT_GROUP]
+    await update.message.reply_text(say("Players saved:\n" + "\n".join(lines)))
 
 
 async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -226,7 +473,6 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(say("Set players first: /players AIDN015 AIDN042"))
         return
 
-    # If no file uploaded yet, try pulling from site
     if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
         try:
             LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
@@ -249,17 +495,137 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = "Weekly Report\n\n"
+    msg += "Selected Players:\n"
+    msg += "\n".join([await format_player(x) for x in CURRENT_GROUP]) + "\n\n"
     msg += f"Group Total: {total:,.2f}\n"
     msg += f"20% Free Play (balances ≤ -100): ${freeplay}\n\n"
 
     if breakdown:
         msg += "Free Play Owed:\n"
         for u, b, fp in breakdown:
-            msg += f"{u.upper()}: {b:,.2f} → ${fp}\n"
+            msg += f"{await format_player(u)}: {b:,.2f} → ${fp}\n"
     else:
         msg += "No accounts qualify for free play (≤ -100)."
 
     await update.message.reply_text(say("\n" + msg))
+
+
+async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LATEST_FILE_BYTES, LATEST_FILE_NAME
+
+    if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
+        try:
+            LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
+        except Exception as e:
+            await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
+            return
+
+    if not LATEST_FILE_BYTES or not LATEST_FILE_NAME:
+        await update.message.reply_text(say("Send the report file first (CSV/XLS/XLSX), or set REPORT_URL on Render."))
+        return
+
+    try:
+        data, err, _ = compute_settle_lists(LATEST_FILE_BYTES, LATEST_FILE_NAME)
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t read that report: {e}"))
+        return
+
+    if err:
+        await update.message.reply_text(say(err))
+        return
+
+    winners = data["winners"]
+    losers = data["losers"]
+
+    msg = "Settle\n\n"
+    msg += f"Total Winners: {data['total_winners']:,.2f}\n"
+    msg += f"Total Losers: {data['total_losers_abs']:,.2f}\n"
+    msg += f"Net: {data['net']:,.2f}\n\n"
+
+    msg += "Winners (owed to you):\n"
+    if winners:
+        for uid, bal in winners:
+            msg += f"{await format_player(uid)}: +{bal:,.2f}\n"
+    else:
+        msg += "None\n"
+
+    msg += "\nLosers (they owe you):\n"
+    if losers:
+        for uid, bal in losers:
+            msg += f"{await format_player(uid)}: {bal:,.2f}\n"
+    else:
+        msg += "None\n"
+
+    await update.message.reply_text(say("\n" + msg))
+
+
+# ---- Name commands ----
+async def cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /name AIDN003 Blake Peterson
+    """
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text(say("Usage: /name AIDN003 Blake (or full name)"))
+        return
+
+    uid = normalize_id(context.args[0])
+    nm = " ".join(context.args[1:]).strip()
+
+    try:
+        await name_set(uid, nm)
+        await update.message.reply_text(say(f"Saved: {uid} ({nm})"))
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t save name: {e}"))
+
+
+async def cmd_name_get(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(say("Usage: /name_get AIDN003"))
+        return
+    uid = normalize_id(context.args[0])
+    nm = await name_get(uid)
+    if nm:
+        await update.message.reply_text(say(f"{uid} = {nm}"))
+    else:
+        await update.message.reply_text(say(f"No name saved for {uid}"))
+
+
+async def cmd_name_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(say("Usage: /name_del AIDN003"))
+        return
+    uid = normalize_id(context.args[0])
+    try:
+        await name_del(uid)
+        await update.message.reply_text(say(f"Deleted name for {uid}"))
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t delete name: {e}"))
+
+
+async def cmd_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        mp = await names_list(limit=500)
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t list names: {e}"))
+        return
+
+    if not mp:
+        await update.message.reply_text(say("No names saved."))
+        return
+
+    lines = [f"{k} = {v}" for k, v in mp.items()]
+    # Telegram message size safety
+    chunk = []
+    size = 0
+    for line in lines:
+        if size + len(line) + 1 > 3500:
+            await update.message.reply_text(say("Names:\n" + "\n".join(chunk)))
+            chunk = []
+            size = 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        await update.message.reply_text(say("Names:\n" + "\n".join(chunk)))
 
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -318,6 +684,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(p in text for p in ["weekly report", "send weekly report", "run weekly", "weekly totals", "/weekly"]):
         return await weekly(update, context)
 
+    if any(p in text for p in ["settle", "settlement", "/settle"]):
+        return await settle(update, context)
+
     if text.startswith("players") or text.startswith("set players"):
         ids = extract_ids(text_raw)
         if not ids:
@@ -329,7 +698,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(p in text for p in ["help", "instructions", "how do i use"]):
         return await start(update, context)
 
-    await update.message.reply_text(say("Try: ‘weekly report’ or ‘players AIDN015 AIDN042’."))
+    await update.message.reply_text(say("Try: ‘weekly report’, ‘settle’, or ‘/players AIDN015 AIDN042’."))
 
 
 # ====== FASTAPI LIFECYCLE + WEBHOOK ======
@@ -342,9 +711,16 @@ async def startup():
         raise RuntimeError("WEBHOOK_SECRET is missing")
 
     tg_app = Application.builder().token(BOT_TOKEN).build()
+
     tg_app.add_handler(CommandHandler("start", start))
     tg_app.add_handler(CommandHandler("players", players))
     tg_app.add_handler(CommandHandler("weekly", weekly))
+    tg_app.add_handler(CommandHandler("settle", settle))
+
+    tg_app.add_handler(CommandHandler("name", cmd_name))
+    tg_app.add_handler(CommandHandler("name_get", cmd_name_get))
+    tg_app.add_handler(CommandHandler("name_del", cmd_name_del))
+    tg_app.add_handler(CommandHandler("names", cmd_names))
 
     tg_app.add_handler(MessageHandler(filters.Document.ALL, handle_file))
     tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
