@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# Optional AI (hybrid): only used when a message starts with "Kenobi ..."
+# Optional AI (hybrid): only used when a message starts with "Kenobi "
 try:
     from openai import OpenAI
 except Exception:
@@ -50,20 +50,25 @@ def say(text: str) -> str:
 
 
 def parse_money(x) -> Optional[float]:
-    # If it's already a number (Excel often sends floats), just return it
+    # Handles numbers already parsed from Excel + strings like "$1,234.56"
+    if x is None:
+        return None
+    try:
+        if pd.isna(x):
+            return None
+    except Exception:
+        pass
+
     if isinstance(x, (int, float)):
         return float(x)
 
-    if x is None:
+    s = str(x).strip()
+    if not s:
         return None
-
-    s = str(x).replace("$", "").replace(",", "").strip()
-    if s == "" or s.lower() == "nan":
-        return None
-
+    s = s.replace("$", "").replace(",", "").strip()
     try:
         return float(s)
-    except:
+    except Exception:
         return None
 
 
@@ -71,93 +76,87 @@ def extract_ids(text: str) -> List[str]:
     return re.findall(r"\b[A-Z]{2,}\d{2,}\b", (text or "").upper())
 
 
-def norm_col(s: str) -> str:
-    # normalize for fuzzy column matching: keep alphanumerics only
-    return re.sub(r"[^a-z0-9]+", "", (s or "").strip().lower())
+def normalize_col_name(x) -> str:
+    return re.sub(r"\s+", " ", str(x or "")).strip().lower()
 
 
-def pick_col(cols, options) -> Optional[str]:
-    # match by normalized name
-    opts = {norm_col(o) for o in options}
-    for c in cols:
-        if norm_col(str(c)) in opts:
-            return c
+def find_header_row(df_raw: pd.DataFrame, required_headers: List[str], search_rows: int = 30) -> Optional[int]:
+    """
+    df_raw is header=None dataframe.
+    Finds a row index where required header(s) appear (case-insensitive).
+    """
+    req = [h.lower() for h in required_headers]
+    max_r = min(search_rows, len(df_raw))
+    for r in range(max_r):
+        row_vals = [normalize_col_name(v) for v in df_raw.iloc[r].tolist()]
+        # if any required header is in that row
+        if all(any(h == cell for cell in row_vals) for h in req):
+            return r
+    # fallback: allow partial match (CustomerId alone)
+    for r in range(max_r):
+        row_vals = [normalize_col_name(v) for v in df_raw.iloc[r].tolist()]
+        if any("customerid" == cell for cell in row_vals):
+            return r
     return None
 
 
-def _find_header_row(df_raw: pd.DataFrame, required_token: str = "customerid") -> Optional[int]:
-    """
-    df_raw is read with header=None. Find the row index that contains 'CustomerId' (case-insensitive).
-    """
-    token = required_token.lower()
-    for i in range(len(df_raw.index)):
-        row = df_raw.iloc[i].astype(str).str.strip().str.lower().tolist()
-        if any(token == cell.replace(" ", "") for cell in row):
-            return i
-    return None
-
-
-def load_dataframe(file_bytes: bytes, filename: str) -> pd.DataFrame:
+def load_report_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     low = filename.lower()
 
-    # CSV path
     if low.endswith(".csv"):
-        # first try normal
+        # CSV usually already has headers, but we still guard
         df = pd.read_csv(io.BytesIO(file_bytes))
-        if pick_col(df.columns, ["CustomerId"]) and pick_col(df.columns, ["C. Balance", "Balance"]):
-            return df
-
-        # fallback: detect header row
-        raw = pd.read_csv(io.BytesIO(file_bytes), header=None)
-        hdr = _find_header_row(raw, "customerid")
-        if hdr is None:
-            return df  # give back the first attempt
-        df2 = pd.read_csv(io.BytesIO(file_bytes), header=hdr)
-        return df2
-
-    # Excel path
-    # first try normal header=0
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, engine="openpyxl")
-    if pick_col(df.columns, ["CustomerId"]) and pick_col(df.columns, ["C. Balance", "Balance"]):
         return df
 
-    # fallback: read raw and detect header row
-    raw = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=None, engine="openpyxl")
-    hdr = _find_header_row(raw, "customerid")
-    if hdr is None:
-        return df  # give back the first attempt
+    # Excel: read with header=None first so we can locate the true header row
+    df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine="openpyxl")
 
-    df2 = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, header=hdr, engine="openpyxl")
-    return df2
+    header_row = find_header_row(df_raw, required_headers=["CustomerId", "C. Balance"])
+    if header_row is None:
+        # If we can't find it, try the first row as header as a last resort
+        df = pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
+        return df
+
+    headers = df_raw.iloc[header_row].tolist()
+    df = df_raw.iloc[header_row + 1 :].copy()
+    df.columns = headers
+    df = df.reset_index(drop=True)
+
+    # Drop completely empty rows
+    df = df.dropna(how="all")
+    return df
 
 
 def compute(file_bytes: bytes, filename: str, current_group: List[str]):
-    df = load_dataframe(file_bytes, filename)
+    df = load_report_table(file_bytes, filename)
 
-    user_col = pick_col(df.columns, ["CustomerId", "Customer", "Username"])
-    bal_col = pick_col(df.columns, ["C. Balance", "Balance"])
+    # normalize column names lookup
+    col_map = {normalize_col_name(c): c for c in df.columns}
 
-    if user_col is None or bal_col is None:
-        return None, None, None, f"Couldn’t find required columns. I see columns: {list(df.columns)}"
+    # expected columns in YOUR file
+    user_col = col_map.get("customerid") or col_map.get("customer id")
+    bal_col = col_map.get("c. balance") or col_map.get("c.balance") or col_map.get("balance") or col_map.get("c balance")
+
+    if not user_col or not bal_col:
+        return None, None, None, "Missing CustomerId or C. Balance column"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.lower()
     df["_b"] = df[bal_col].apply(parse_money)
 
-    # -------- Group total (selected players only) --------
-    selected = [u.strip().lower() for u in (current_group or [])]
+    # ---- Group total (selected players only) ----
+    selected = [u.strip().lower() for u in current_group]
     sub = df[df["_u"].isin(selected)]
     group_total = float(sub["_b"].fillna(0).sum())
 
-    # -------- Free play (ALL players, based on C. Balance) --------
+    # ---- Free play (ALL players) ----
     freeplay_total = 0
     breakdown = []
-
     for _, r in df.iterrows():
         bal = r["_b"]
         if bal is not None and bal <= -100:
-            fp = round(abs(bal) * 0.20)
+            fp = int(round(abs(bal) * 0.20))
             freeplay_total += fp
-            breakdown.append((str(r[user_col]).strip(), float(bal), int(fp)))
+            breakdown.append((str(r[user_col]).strip(), float(bal), fp))
 
     return group_total, freeplay_total, breakdown, None
 
@@ -201,10 +200,11 @@ async def fetch_report_bytes() -> Tuple[bytes, str]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         say(
-            "Here’s how to use me:\n"
-            "1) Set players: /players AIDN003 AIDN014\n"
-            "2) Upload report file (CSV/XLS/XLSX) OR run /weekly if REPORT_URL is configured\n"
-            "3) /weekly returns group total + 20% free play owed list"
+            "How to use:\n"
+            "1) /players AIDN003 AIDN014\n"
+            "2) Upload report (CSV/XLS/XLSX) OR run /weekly if REPORT_URL is set\n"
+            "3) Say 'weekly report' anytime to run it\n\n"
+            "AI only triggers if you type: Kenobi <message>"
         )
     )
 
@@ -212,7 +212,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CURRENT_GROUP
     if not context.args:
-        await update.message.reply_text(say("Usage: /players AIDN003 AIDN014"))
+        await update.message.reply_text(say("Usage: /players AIDN015 AIDN042"))
         return
 
     CURRENT_GROUP = context.args
@@ -223,7 +223,7 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LATEST_FILE_BYTES, LATEST_FILE_NAME
 
     if not CURRENT_GROUP:
-        await update.message.reply_text(say("Set players first: /players AIDN003 AIDN014"))
+        await update.message.reply_text(say("Set players first: /players AIDN015 AIDN042"))
         return
 
     # If no file uploaded yet, try pulling from site
@@ -234,7 +234,6 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
             return
 
-    # Fallback: use last uploaded
     if not LATEST_FILE_BYTES or not LATEST_FILE_NAME:
         await update.message.reply_text(say("Send the report file first (CSV/XLS/XLSX), or set REPORT_URL on Render."))
         return
@@ -250,8 +249,8 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = "Weekly Report\n\n"
-    msg += f"Group Total (selected players, from C. Balance): {total:,.2f}\n"
-    msg += f"20% Free Play Owed (ALL players where C. Balance ≤ -100): ${freeplay}\n\n"
+    msg += f"Group Total: {total:,.2f}\n"
+    msg += f"20% Free Play (balances ≤ -100): ${freeplay}\n\n"
 
     if breakdown:
         msg += "Free Play Owed:\n"
@@ -291,51 +290,46 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_raw = (update.message.text or "").strip()
     text = text_raw.lower()
 
-    # Paid AI trigger (hybrid): must start with "Kenobi"
-    if text.startswith("kenobi"):
+    # AI trigger: MUST be "kenobi " (with a space)
+    if text.startswith("kenobi "):
         if not oa_client:
             await update.message.reply_text(say("AI isn’t configured yet. Add OPENAI_API_KEY on Render."))
             return
 
-        prompt = text_raw[len("kenobi"):].strip()
+        prompt = text_raw[len("kenobi "):].strip()
         if not prompt:
-            await update.message.reply_text(say("Example: Kenobi summarize what free play is owed"))
+            await update.message.reply_text(say("Example: Kenobi summarize this week"))
             return
 
         try:
             resp = oa_client.responses.create(
                 model="gpt-5-mini",
                 input=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are Kenobi, a calm and practical assistant. "
-                            "Always address the user as 'sir'. Keep replies concise."
-                        ),
-                    },
+                    {"role": "system", "content": "You are Kenobi. Always address the user as 'sir'. Keep replies concise."},
                     {"role": "user", "content": prompt},
                 ],
             )
-            await update.message.reply_text(say(resp.output_text))
+            await update.message.reply_text(resp.output_text)
         except Exception as e:
             await update.message.reply_text(say(f"AI error: {e}"))
         return
 
+    # Weekly intents
     if any(p in text for p in ["weekly report", "send weekly report", "run weekly", "weekly totals", "/weekly"]):
         return await weekly(update, context)
 
     if text.startswith("players") or text.startswith("set players"):
         ids = extract_ids(text_raw)
         if not ids:
-            await update.message.reply_text(say("Tell me IDs like: players AIDN003 AIDN014"))
+            await update.message.reply_text(say("Tell me IDs like: players AIDN015 AIDN042"))
             return
         context.args = ids
         return await players(update, context)
 
-    if any(p in text for p in ["help", "instructions", "what do i do", "how do i use"]):
+    if any(p in text for p in ["help", "instructions", "how do i use"]):
         return await start(update, context)
 
-    await update.message.reply_text(say("Try: ‘weekly report’ or ‘players AIDN003 AIDN014’."))
+    await update.message.reply_text(say("Try: ‘weekly report’ or ‘players AIDN015 AIDN042’."))
 
 
 # ====== FASTAPI LIFECYCLE + WEBHOOK ======
