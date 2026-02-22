@@ -97,11 +97,17 @@ def compute(file_bytes, filename, current_group):
     if user_col is None or bal_col is None:
         return None, None, None, "Missing CustomerId or Balance column"
 
-    df["_u"] = df[user_col].astype(str).str.strip().str.lower()
+    df["_u"] = (
+    df[user_col]
+    .astype(str)
+    .str.strip()
+    .str.replace(" ", "", regex=False)
+    .str.upper()
+)
     df["_b"] = df[bal_col].apply(parse_money)
 
     # ===== GROUP TOTAL (selected only) =====
-    selected = [u.lower() for u in current_group]
+    selected = [u.strip().replace(" ", "").upper() for u in current_group]
     sub = df[df["_u"].isin(selected)]
     group_total = float(sub["_b"].fillna(0).sum())
 
