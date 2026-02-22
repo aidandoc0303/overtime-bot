@@ -177,19 +177,18 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # If no file uploaded yet, try pulling from site
-if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
-    try:
-        LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
-    except Exception as e:
-        await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
-        return
+    if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
+        try:
+            LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
         except Exception as e:
             await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
             return
 
     # Fallback: use last uploaded
     if not LATEST_FILE_BYTES or not LATEST_FILE_NAME:
-        await update.message.reply_text(say("Send the report file first (CSV/XLS/XLSX), or set REPORT_URL on Render."))
+        await update.message.reply_text(
+            say("Send the report file first (CSV/XLS/XLSX), or set REPORT_URL on Render.")
+        )
         return
 
     try:
@@ -199,8 +198,8 @@ if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
         return
 
     if err:
-    await update.message.reply_text(say(err))
-    return
+        await update.message.reply_text(say(err))
+        return
 
     msg = "Weekly Report\n\n"
     msg += f"Group Total: {total:,.2f}\n"
@@ -209,7 +208,7 @@ if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
     if breakdown:
         msg += "Free Play Owed:\n"
         for u, b, fp in breakdown:
-            msg += f"{u.upper()}: {b:,.2f} → ${fp}\n"
+            msg += f"{str(u).upper()}: {b:,.2f} → ${fp}\n"
     else:
         msg += "No accounts qualify for free play (≤ -100)."
 
