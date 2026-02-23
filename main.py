@@ -173,18 +173,25 @@ def find_header_row(df_raw: pd.DataFrame, required_headers: List[str], search_ro
         if all(any(h == cell for cell in row_vals) for h in req):
             return r
 
-    # fallback: allow partial match (CustomerId alone)
+    # fallback: allow partial match (CustomerId alone) OR (Id alone)
     for r in range(max_r):
         row_vals = [normalize_col_name(v) for v in df_raw.iloc[r].tolist()]
-        if any("customerid" == cell for cell in row_vals):
+        if any("customerid" == cell for cell in row_vals) or any("id" == cell for cell in row_vals):
             return r
 
     return None
 
 
 def _looks_like_html(file_bytes: bytes) -> bool:
-    head = (file_bytes[:256] or b"").lstrip().lower()
-    return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<html" in head[:80]
+    head = (file_bytes[:800] or b"").lstrip().lower()
+    return (
+        head.startswith(b"<!doctype")
+        or head.startswith(b"<html")
+        or b"<html" in head[:200]
+        or b"<title" in head[:400]
+        or b"<form" in head[:600]
+        or b"login" in head[:800]
+    )
 
 
 def _read_excel_any_engine(file_bytes: bytes, header, filename: str) -> pd.DataFrame:
@@ -223,13 +230,15 @@ def load_report_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     try:
         df_raw = _read_excel_any_engine(file_bytes, header=None, filename=filename)
     except zipfile.BadZipFile:
-        # This is the classic "File is not a zip file" when trying to read non-xlsx with openpyxl,
-        # or when the content isn't actually an Excel file.
         raise ValueError("Excel read failed (not a valid .xlsx zip). If this is .xls, install xlrd, or export as .xlsx/.csv.")
     except Exception as e:
         raise ValueError(f"Excel read failed: {e}")
 
+    # Try BOTH possible header sets
     header_row = find_header_row(df_raw, required_headers=["CustomerId", "C. Balance"])
+    if header_row is None:
+        header_row = find_header_row(df_raw, required_headers=["Id", "OverallFigure"])
+
     if header_row is None:
         # last resort: try pandas normal header parse
         try:
@@ -276,7 +285,6 @@ async def upstash_call(path: str, method: str = "GET", body: Optional[str] = Non
 
 async def name_get(uid: str) -> Optional[str]:
     uid = normalize_id(uid)
-    # Upstash
     if upstash_enabled():
         try:
             data = await upstash_call(f"GET/{NAME_KEY_PREFIX}{uid}", method="GET")
@@ -286,7 +294,6 @@ async def name_get(uid: str) -> Optional[str]:
         except Exception:
             pass
 
-    # Fallback
     return PLAYER_NAMES.get(uid)
 
 
@@ -351,7 +358,6 @@ async def format_player(user_id: str) -> str:
 
 
 def build_snap_message(display_name: str, amount: float) -> str:
-    # chill + firm, starts with "Yo", encourages sending today (NO "if you can")
     return f"{display_name} — Yo you’re down ${amount:,.2f} this week. Please send today. Venmo {VENMO_HANDLE}"
 
 
@@ -369,16 +375,26 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
 
     col_map = {normalize_col_name(c): c for c in df.columns}
 
-    user_col = col_map.get("customerid") or col_map.get("customer id")
+    # Support BOTH formats:
+    # Old: CustomerId + C. Balance
+    # New: Id + OverallFigure
+    user_col = (
+        col_map.get("customerid")
+        or col_map.get("customer id")
+        or col_map.get("id")
+    )
+
     bal_col = (
         col_map.get("c. balance")
         or col_map.get("c.balance")
         or col_map.get("c balance")
         or col_map.get("balance")
+        or col_map.get("overallfigure")
+        or col_map.get("overall figure")
     )
 
     if not user_col or not bal_col:
-        return None, None, None, None, "Missing CustomerId or C. Balance column"
+        return None, None, None, None, "Missing Id/CustomerId or OverallFigure/C. Balance column"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money)
@@ -389,8 +405,6 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
     sub["_b"] = sub["_b"].fillna(0)
 
     per_player = sub.groupby("_u")["_b"].sum().to_dict()
-
-    # ensure all selected appear (even if missing)
     for uid in selected:
         per_player.setdefault(uid, 0.0)
 
@@ -411,16 +425,26 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
 
 def compute_settle_lists(file_bytes: bytes, filename: str):
     df = load_report_table(file_bytes, filename)
+
     col_map = {normalize_col_name(c): c for c in df.columns}
-    user_col = col_map.get("customerid") or col_map.get("customer id")
+
+    user_col = (
+        col_map.get("customerid")
+        or col_map.get("customer id")
+        or col_map.get("id")
+    )
+
     bal_col = (
         col_map.get("c. balance")
         or col_map.get("c.balance")
         or col_map.get("c balance")
         or col_map.get("balance")
+        or col_map.get("overallfigure")
+        or col_map.get("overall figure")
     )
+
     if not user_col or not bal_col:
-        return None, None, "Missing CustomerId or C. Balance column"
+        return None, None, "Missing Id/CustomerId or OverallFigure/C. Balance column"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money).fillna(0)
@@ -547,7 +571,7 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = "Weekly Report\n\n"
-    msg += "Selected Players (C. Balance):\n"
+    msg += "Selected Players (Balance):\n"
     for uid in CURRENT_GROUP:
         bal = float((per_player or {}).get(normalize_id(uid), 0.0))
         msg += f"{await format_player(uid)}: {bal:,.2f}\n"
