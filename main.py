@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import zipfile
 from typing import Optional, Tuple, List, Dict, Any
 
 import pandas as pd
@@ -181,19 +182,60 @@ def find_header_row(df_raw: pd.DataFrame, required_headers: List[str], search_ro
     return None
 
 
+def _looks_like_html(file_bytes: bytes) -> bool:
+    head = (file_bytes[:256] or b"").lstrip().lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html") or b"<html" in head[:80]
+
+
+def _read_excel_any_engine(file_bytes: bytes, header, filename: str) -> pd.DataFrame:
+    """
+    Robust Excel reader:
+      - .xlsx -> openpyxl
+      - .xls  -> xlrd (if installed), else fallback to default engine
+    """
+    low = filename.lower()
+
+    if low.endswith(".xlsx"):
+        return pd.read_excel(io.BytesIO(file_bytes), header=header, engine="openpyxl")
+
+    if low.endswith(".xls"):
+        # Old binary Excel needs xlrd (pandas removed built-in support unless xlrd installed)
+        try:
+            return pd.read_excel(io.BytesIO(file_bytes), header=header, engine="xlrd")
+        except Exception:
+            # fallback: let pandas try whatever is installed
+            return pd.read_excel(io.BytesIO(file_bytes), header=header)
+
+    # unknown extension fallback
+    return pd.read_excel(io.BytesIO(file_bytes), header=header)
+
+
 def load_report_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     low = filename.lower()
 
     if low.endswith(".csv"):
         return pd.read_csv(io.BytesIO(file_bytes))
 
+    if _looks_like_html(file_bytes):
+        raise ValueError("Report download looks like an HTML page (login/redirect). Check REPORT_URL/cookies/auth.")
+
     # Excel: read with header=None first so we can locate the true header row
-    df_raw = pd.read_excel(io.BytesIO(file_bytes), header=None, engine="openpyxl")
+    try:
+        df_raw = _read_excel_any_engine(file_bytes, header=None, filename=filename)
+    except zipfile.BadZipFile:
+        # This is the classic "File is not a zip file" when trying to read non-xlsx with openpyxl,
+        # or when the content isn't actually an Excel file.
+        raise ValueError("Excel read failed (not a valid .xlsx zip). If this is .xls, install xlrd, or export as .xlsx/.csv.")
+    except Exception as e:
+        raise ValueError(f"Excel read failed: {e}")
 
     header_row = find_header_row(df_raw, required_headers=["CustomerId", "C. Balance"])
     if header_row is None:
         # last resort: try pandas normal header parse
-        return pd.read_excel(io.BytesIO(file_bytes), engine="openpyxl")
+        try:
+            return _read_excel_any_engine(file_bytes, header=0, filename=filename)
+        except Exception as e:
+            raise ValueError(f"Couldn’t find headers and default read failed: {e}")
 
     headers = df_raw.iloc[header_row].tolist()
     df = df_raw.iloc[header_row + 1 :].copy()
@@ -315,6 +357,14 @@ def build_snap_message(display_name: str, amount: float) -> str:
 
 # ====== CORE COMPUTE ======
 def compute(file_bytes: bytes, filename: str, current_group: List[str]):
+    """
+    Returns:
+      group_total: float
+      per_player: Dict[uid, balance]  (selected players only)
+      freeplay_total: int
+      breakdown: List[(uid, balance, freeplay)]
+      err: Optional[str]
+    """
     df = load_report_table(file_bytes, filename)
 
     col_map = {normalize_col_name(c): c for c in df.columns}
@@ -328,15 +378,23 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
     )
 
     if not user_col or not bal_col:
-        return None, None, None, "Missing CustomerId or C. Balance column"
+        return None, None, None, None, "Missing CustomerId or C. Balance column"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money)
 
-    # ---- Group total (selected players only) ----
+    # ---- Selected players (sum by player in case duplicates) ----
     selected = [normalize_id(u) for u in current_group]
-    sub = df[df["_u"].isin(selected)]
-    group_total = float(sub["_b"].fillna(0).sum())
+    sub = df[df["_u"].isin(selected)].copy()
+    sub["_b"] = sub["_b"].fillna(0)
+
+    per_player = sub.groupby("_u")["_b"].sum().to_dict()
+
+    # ensure all selected appear (even if missing)
+    for uid in selected:
+        per_player.setdefault(uid, 0.0)
+
+    group_total = float(sum(per_player.values()))
 
     # ---- Free play (ALL players) ----
     freeplay_total = 0
@@ -348,7 +406,7 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
             freeplay_total += fp
             breakdown.append((str(r[user_col]).strip(), float(bal), fp))
 
-    return group_total, freeplay_total, breakdown, None
+    return group_total, per_player, freeplay_total, breakdown, None
 
 
 def compute_settle_lists(file_bytes: bytes, filename: str):
@@ -479,7 +537,7 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        total, freeplay, breakdown, err = compute(LATEST_FILE_BYTES, LATEST_FILE_NAME, CURRENT_GROUP)
+        total, per_player, freeplay, breakdown, err = compute(LATEST_FILE_BYTES, LATEST_FILE_NAME, CURRENT_GROUP)
     except Exception as e:
         await update.message.reply_text(say(f"Couldn’t read that report: {e}"))
         return
@@ -489,8 +547,12 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = "Weekly Report\n\n"
-    msg += "Selected Players:\n"
-    msg += "\n".join([await format_player(x) for x in CURRENT_GROUP]) + "\n\n"
+    msg += "Selected Players (C. Balance):\n"
+    for uid in CURRENT_GROUP:
+        bal = float((per_player or {}).get(normalize_id(uid), 0.0))
+        msg += f"{await format_player(uid)}: {bal:,.2f}\n"
+
+    msg += "\n"
     msg += f"Group Total: {total:,.2f}\n"
     msg += f"20% Free Play (balances ≤ -100): ${freeplay}\n\n"
 
