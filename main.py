@@ -34,6 +34,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL")
 UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 
+# SNAP COPY/PASTE (Venmo handle)
+VENMO_HANDLE = os.getenv("VENMO_HANDLE", "@aidandoc3")
+
 
 # ====== APP STATE ======
 app = FastAPI()
@@ -235,12 +238,10 @@ async def name_get(uid: str) -> Optional[str]:
     if upstash_enabled():
         try:
             data = await upstash_call(f"GET/{NAME_KEY_PREFIX}{uid}", method="GET")
-            # {"result": "..."} or {"result": None}
             val = data.get("result")
             if isinstance(val, str) and val.strip():
                 return val.strip()
         except Exception:
-            # If Upstash hiccups, fall back to local
             pass
 
     # Fallback
@@ -253,20 +254,15 @@ async def name_set(uid: str, name: str) -> None:
     if not nm:
         raise ValueError("Name is empty")
 
-    # Update fallback map in-memory too
     PLAYER_NAMES[uid] = nm
 
     if upstash_enabled():
-        # POST /SET/<key>  body=value
         await upstash_call(f"SET/{NAME_KEY_PREFIX}{uid}", method="POST", body=nm)
 
 
 async def name_del(uid: str) -> None:
     uid = normalize_id(uid)
-    # Remove local override
     if uid in PLAYER_NAMES:
-        # Keep your built-in list? If you want delete to truly remove,
-        # we’ll delete from local map too.
         del PLAYER_NAMES[uid]
 
     if upstash_enabled():
@@ -274,24 +270,16 @@ async def name_del(uid: str) -> None:
 
 
 async def names_list(limit: int = 500) -> Dict[str, str]:
-    """
-    Lists names stored in Upstash under the prefix.
-    Falls back to local PLAYER_NAMES if Upstash not set.
-    """
     if not upstash_enabled():
-        # Return local snapshot
         return dict(sorted(PLAYER_NAMES.items()))
 
-    # Use SCAN to find matching keys
     cursor = "0"
     found: Dict[str, str] = {}
 
-    # prevent runaway loops
     for _ in range(20):
         data = await upstash_call(f"SCAN/{cursor}/MATCH/{NAME_KEY_PREFIX}*/COUNT/200", method="GET")
         res = data.get("result")
 
-        # Upstash returns something like: ["0", ["k1","k2"]]
         if isinstance(res, list) and len(res) == 2:
             cursor = str(res[0])
             keys = res[1] if isinstance(res[1], list) else []
@@ -318,6 +306,11 @@ async def format_player(user_id: str) -> str:
     uid = normalize_id(user_id)
     nm = await name_get(uid)
     return f"{uid} ({nm})" if nm else uid
+
+
+def build_snap_message(display_name: str, amount: float) -> str:
+    # chill + firm, starts with "Yo", encourages sending today (NO "if you can")
+    return f"{display_name} — Yo you’re down ${amount:,.2f} this week. Please send today. Venmo {VENMO_HANDLE}"
 
 
 # ====== CORE COMPUTE ======
@@ -449,7 +442,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  /name_del AIDN003\n"
             "  /names\n\n"
             "Settles:\n"
-            "  /settle (splits winners vs losers)\n\n"
+            "  /settle (splits winners vs losers)\n"
+            "  /snap (copy/paste Snap messages for LOSERS)\n\n"
             "AI only triggers if you type: Kenobi <message>"
         )
     )
@@ -559,6 +553,47 @@ async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(say("\n" + msg))
 
 
+async def snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /snap -> outputs copy/paste Snap messages for LOSERS only
+    """
+    global LATEST_FILE_BYTES, LATEST_FILE_NAME
+
+    if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
+        try:
+            LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
+        except Exception as e:
+            await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
+            return
+
+    if not LATEST_FILE_BYTES or not LATEST_FILE_NAME:
+        await update.message.reply_text(say("Send the report file first (CSV/XLS/XLSX), or set REPORT_URL on Render."))
+        return
+
+    try:
+        data, err, _ = compute_settle_lists(LATEST_FILE_BYTES, LATEST_FILE_NAME)
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t read that report: {e}"))
+        return
+
+    if err:
+        await update.message.reply_text(say(err))
+        return
+
+    losers = data["losers"]
+    if not losers:
+        await update.message.reply_text(say("No losers this week (no balances < 0)."))
+        return
+
+    msg = "Snap Messages (copy & paste)\n\n"
+    for uid, bal in losers:
+        display = await format_player(uid)
+        amt = abs(float(bal))
+        msg += build_snap_message(display, amt) + "\n\n"
+
+    await update.message.reply_text(say(msg))
+
+
 # ---- Name commands ----
 async def cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -614,7 +649,6 @@ async def cmd_names(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     lines = [f"{k} = {v}" for k, v in mp.items()]
-    # Telegram message size safety
     chunk = []
     size = 0
     for line in lines:
@@ -687,6 +721,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(p in text for p in ["settle", "settlement", "/settle"]):
         return await settle(update, context)
 
+    if any(p in text for p in ["snap", "/snap", "snap messages", "snapchat"]):
+        return await snap(update, context)
+
     if text.startswith("players") or text.startswith("set players"):
         ids = extract_ids(text_raw)
         if not ids:
@@ -698,7 +735,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(p in text for p in ["help", "instructions", "how do i use"]):
         return await start(update, context)
 
-    await update.message.reply_text(say("Try: ‘weekly report’, ‘settle’, or ‘/players AIDN015 AIDN042’."))
+    await update.message.reply_text(say("Try: ‘weekly report’, ‘settle’, ‘snap’, or ‘/players AIDN015 AIDN042’."))
 
 
 # ====== FASTAPI LIFECYCLE + WEBHOOK ======
@@ -716,6 +753,7 @@ async def startup():
     tg_app.add_handler(CommandHandler("players", players))
     tg_app.add_handler(CommandHandler("weekly", weekly))
     tg_app.add_handler(CommandHandler("settle", settle))
+    tg_app.add_handler(CommandHandler("snap", snap))
 
     tg_app.add_handler(CommandHandler("name", cmd_name))
     tg_app.add_handler(CommandHandler("name_get", cmd_name_get))
