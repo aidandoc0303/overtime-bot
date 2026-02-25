@@ -578,7 +578,7 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg += "\n"
     msg += f"Group Total: {total:,.2f}\n"
-    msg += f"20% Free Play (balances ≤ -100): ${freeplay}\n\n"
+    msg += f"25% Free Play (balances ≤ -100): ${freeplay}\n\n"
 
     if breakdown:
         msg += "Free Play Owed:\n"
