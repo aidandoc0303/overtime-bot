@@ -416,7 +416,7 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
     for _, r in df.iterrows():
         bal = r["_b"]
         if bal is not None and bal <= -100:
-            fp = int(round(abs(bal) * 0.20))
+            fp = int(round(abs(bal) * 0.25))
             freeplay_total += fp
             breakdown.append((str(r[user_col]).strip(), float(bal), fp))
 
