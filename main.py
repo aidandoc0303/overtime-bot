@@ -206,14 +206,11 @@ def _read_excel_any_engine(file_bytes: bytes, header, filename: str) -> pd.DataF
         return pd.read_excel(io.BytesIO(file_bytes), header=header, engine="openpyxl")
 
     if low.endswith(".xls"):
-        # Old binary Excel needs xlrd (pandas removed built-in support unless xlrd installed)
         try:
             return pd.read_excel(io.BytesIO(file_bytes), header=header, engine="xlrd")
         except Exception:
-            # fallback: let pandas try whatever is installed
             return pd.read_excel(io.BytesIO(file_bytes), header=header)
 
-    # unknown extension fallback
     return pd.read_excel(io.BytesIO(file_bytes), header=header)
 
 
@@ -234,8 +231,10 @@ def load_report_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     except Exception as e:
         raise ValueError(f"Excel read failed: {e}")
 
-    # Try BOTH possible header sets
+    # Try BOTH possible header sets (old/new)
     header_row = find_header_row(df_raw, required_headers=["CustomerId", "C. Balance"])
+    if header_row is None:
+        header_row = find_header_row(df_raw, required_headers=["Id", "ThisWeek"])
     if header_row is None:
         header_row = find_header_row(df_raw, required_headers=["Id", "OverallFigure"])
 
@@ -260,13 +259,6 @@ def upstash_enabled() -> bool:
 
 
 async def upstash_call(path: str, method: str = "GET", body: Optional[str] = None, params: Optional[Dict[str, str]] = None) -> Any:
-    """
-    Upstash REST API: command + args are path segments, like:
-      GET  /GET/key
-      POST /SET/key   with body = value
-      GET  /DEL/key
-      GET  /SCAN/0/MATCH/pattern/COUNT/100
-    """
     if not upstash_enabled():
         raise RuntimeError("Upstash is not configured (missing UPSTASH_REDIS_REST_URL/TOKEN)")
 
@@ -293,7 +285,6 @@ async def name_get(uid: str) -> Optional[str]:
                 return val.strip()
         except Exception:
             pass
-
     return PLAYER_NAMES.get(uid)
 
 
@@ -370,22 +361,21 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
       freeplay_total: int
       breakdown: List[(uid, balance, freeplay)]
       err: Optional[str]
+      used_cols: Dict[str,str]
     """
     df = load_report_table(file_bytes, filename)
-
     col_map = {normalize_col_name(c): c for c in df.columns}
 
     # Support BOTH formats:
     # Old: CustomerId + C. Balance
-    # New: Id + OverallFigure
-    user_col = (
-        col_map.get("customerid")
-        or col_map.get("customer id")
-        or col_map.get("id")
-    )
+    # New: Id + ThisWeek  (we WANT ThisWeek)
+    user_col = col_map.get("id") or col_map.get("customerid") or col_map.get("customer id")
 
+    # FORCE ThisWeek if present; fallback to C. Balance; only then OverallFigure
     bal_col = (
-        col_map.get("c. balance")
+        col_map.get("thisweek")
+        or col_map.get("this week")
+        or col_map.get("c. balance")
         or col_map.get("c.balance")
         or col_map.get("c balance")
         or col_map.get("balance")
@@ -394,7 +384,7 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
     )
 
     if not user_col or not bal_col:
-        return None, None, None, None, "Missing Id/CustomerId or OverallFigure/C. Balance column"
+        return None, None, None, None, "Missing Id/CustomerId or ThisWeek/C. Balance column", None
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money)
@@ -420,22 +410,21 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
             freeplay_total += fp
             breakdown.append((str(r[user_col]).strip(), float(bal), fp))
 
-    return group_total, per_player, freeplay_total, breakdown, None
+    used_cols = {"user_col": str(user_col), "bal_col": str(bal_col)}
+    return group_total, per_player, freeplay_total, breakdown, None, used_cols
 
 
 def compute_settle_lists(file_bytes: bytes, filename: str):
     df = load_report_table(file_bytes, filename)
-
     col_map = {normalize_col_name(c): c for c in df.columns}
 
-    user_col = (
-        col_map.get("customerid")
-        or col_map.get("customer id")
-        or col_map.get("id")
-    )
+    user_col = col_map.get("id") or col_map.get("customerid") or col_map.get("customer id")
 
+    # FORCE ThisWeek if present; fallback to C. Balance; only then OverallFigure
     bal_col = (
-        col_map.get("c. balance")
+        col_map.get("thisweek")
+        or col_map.get("this week")
+        or col_map.get("c. balance")
         or col_map.get("c.balance")
         or col_map.get("c balance")
         or col_map.get("balance")
@@ -444,7 +433,7 @@ def compute_settle_lists(file_bytes: bytes, filename: str):
     )
 
     if not user_col or not bal_col:
-        return None, None, "Missing Id/CustomerId or OverallFigure/C. Balance column"
+        return None, None, "Missing Id/CustomerId or ThisWeek/C. Balance column"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money).fillna(0)
@@ -472,6 +461,7 @@ def compute_settle_lists(file_bytes: bytes, filename: str):
         "total_winners": total_winners,
         "total_losers_abs": total_losers_abs,
         "net": net,
+        "used_cols": {"user_col": str(user_col), "bal_col": str(bal_col)},
     }, None, None
 
 
@@ -561,7 +551,7 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        total, per_player, freeplay, breakdown, err = compute(LATEST_FILE_BYTES, LATEST_FILE_NAME, CURRENT_GROUP)
+        total, per_player, freeplay, breakdown, err, used_cols = compute(LATEST_FILE_BYTES, LATEST_FILE_NAME, CURRENT_GROUP)
     except Exception as e:
         await update.message.reply_text(say(f"Couldn’t read that report: {e}"))
         return
@@ -571,6 +561,9 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = "Weekly Report\n\n"
+    if used_cols:
+        msg += f"Using columns: {used_cols.get('user_col')} + {used_cols.get('bal_col')}\n\n"
+
     msg += "Selected Players (Balance):\n"
     for uid in CURRENT_GROUP:
         bal = float((per_player or {}).get(normalize_id(uid), 0.0))
@@ -616,8 +609,12 @@ async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     winners = data["winners"]
     losers = data["losers"]
+    used_cols = data.get("used_cols") or {}
 
     msg = "Settle\n\n"
+    if used_cols:
+        msg += f"Using columns: {used_cols.get('user_col')} + {used_cols.get('bal_col')}\n\n"
+
     msg += f"Total Winners: {data['total_winners']:,.2f}\n"
     msg += f"Total Losers: {data['total_losers_abs']:,.2f}\n"
     msg += f"Net: {data['net']:,.2f}\n\n"
@@ -640,9 +637,6 @@ async def settle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /snap -> outputs copy/paste Snap messages for LOSERS only
-    """
     global LATEST_FILE_BYTES, LATEST_FILE_NAME
 
     if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
@@ -682,9 +676,6 @@ async def snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---- Name commands ----
 async def cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /name AIDN003 Blake Peterson
-    """
     if not context.args or len(context.args) < 2:
         await update.message.reply_text(say("Usage: /name AIDN003 Blake (or full name)"))
         return
@@ -800,7 +791,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(say(f"AI error: {e}"))
         return
 
-    # Weekly intents
     if any(p in text for p in ["weekly report", "send weekly report", "run weekly", "weekly totals", "/weekly"]):
         return await weekly(update, context)
 
