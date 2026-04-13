@@ -38,6 +38,18 @@ UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN")
 # SNAP COPY/PASTE (Venmo handle)
 VENMO_HANDLE = os.getenv("VENMO_HANDLE", "@aidandoc3")
 
+# VENMO SPLIT HANDLES
+VENMO_HANDLES = [
+    "@colin-wurth",
+    "@morganwilliamson25",
+    "@t6fitz",
+    "@Albert-Zone",
+    "@CalcinShirley1",
+    "@Anthonydep11",
+    "@Cvesey3",
+]
+VENMO_MAX_CENTS_PER_HANDLE = 999900  # $9,999.00
+
 
 # ====== APP STATE ======
 app = FastAPI()
@@ -160,6 +172,14 @@ def parse_money(x) -> Optional[float]:
 
 def normalize_col_name(x) -> str:
     return re.sub(r"\s+", " ", str(x or "")).strip().lower()
+
+
+def money_to_cents(amount: float) -> int:
+    return int(round(float(amount) * 100))
+
+
+def cents_to_money_str(cents: int) -> str:
+    return f"{cents / 100:,.2f}"
 
 
 def find_header_row(df_raw: pd.DataFrame, required_headers: List[str], search_rows: int = 30) -> Optional[int]:
@@ -341,6 +361,126 @@ def build_snap_message(display_name: str, amount: float) -> str:
     return f"{display_name} — Yo you’re down ${amount:,.2f} this week. Please send today. Venmo {VENMO_HANDLE}"
 
 
+def build_venmo_message(amount_cents: int, venmo_handle: str) -> str:
+    return f"Yo you’re down ${cents_to_money_str(amount_cents)} this week. Please send today. Venmo: {venmo_handle}"
+
+
+def allocate_venmo_requests(losers: List[Tuple[str, float]]) -> Dict[str, Any]:
+    """
+    Returns:
+      {
+        "handle_totals": Dict[str, int],  # cents
+        "assignments": Dict[str, List[Tuple[int, str]]],  # uid -> [(cents, handle), ...]
+        "active_handles": List[str],
+        "total_cents": int,
+      }
+    """
+    normalized_losers: List[Tuple[str, int]] = []
+    total_cents = 0
+    for uid, bal in losers:
+        owed_cents = money_to_cents(abs(float(bal)))
+        if owed_cents > 0:
+            normalized_losers.append((normalize_id(uid), owed_cents))
+            total_cents += owed_cents
+
+    total_capacity = len(VENMO_HANDLES) * VENMO_MAX_CENTS_PER_HANDLE
+    if total_cents > total_capacity:
+        raise ValueError(
+            f"Total owed ${cents_to_money_str(total_cents)} exceeds total Venmo capacity "
+            f"${cents_to_money_str(total_capacity)} across {len(VENMO_HANDLES)} handles."
+        )
+
+    if total_cents == 0:
+        return {
+            "handle_totals": {h: 0 for h in VENMO_HANDLES},
+            "assignments": {},
+            "active_handles": [],
+            "total_cents": 0,
+        }
+
+    min_handles_needed = max(1, (total_cents + VENMO_MAX_CENTS_PER_HANDLE - 1) // VENMO_MAX_CENTS_PER_HANDLE)
+    active_handles = VENMO_HANDLES[:min_handles_needed]
+
+    while True:
+        handle_count = len(active_handles)
+        base = total_cents // handle_count
+        rem = total_cents % handle_count
+        targets = {}
+        ok = True
+        for i, h in enumerate(active_handles):
+            target = base + (1 if i < rem else 0)
+            targets[h] = target
+            if target > VENMO_MAX_CENTS_PER_HANDLE:
+                ok = False
+        if ok:
+            break
+        if handle_count >= len(VENMO_HANDLES):
+            raise ValueError("Unable to distribute Venmo requests within the $9,999.00 per handle limit.")
+        active_handles = VENMO_HANDLES[: handle_count + 1]
+
+    assigned_totals: Dict[str, int] = {h: 0 for h in active_handles}
+    assignments: Dict[str, List[Tuple[int, str]]] = {}
+
+    for uid, owed_cents in normalized_losers:
+        remaining = owed_cents
+        assignments[uid] = []
+
+        while remaining > 0:
+            candidate_handles = sorted(
+                active_handles,
+                key=lambda h: (
+                    targets[h] - assigned_totals[h],
+                    VENMO_MAX_CENTS_PER_HANDLE - assigned_totals[h],
+                    -active_handles.index(h),
+                ),
+                reverse=True,
+            )
+
+            placed = False
+            for handle in candidate_handles:
+                deficit = max(0, targets[handle] - assigned_totals[handle])
+                capacity_left = VENMO_MAX_CENTS_PER_HANDLE - assigned_totals[handle]
+                if capacity_left <= 0:
+                    continue
+
+                chunk = min(remaining, capacity_left)
+                if deficit > 0:
+                    chunk = min(chunk, deficit)
+
+                if chunk <= 0:
+                    continue
+
+                assignments[uid].append((chunk, handle))
+                assigned_totals[handle] += chunk
+                remaining -= chunk
+                placed = True
+                break
+
+            if not placed:
+                for handle in active_handles:
+                    capacity_left = VENMO_MAX_CENTS_PER_HANDLE - assigned_totals[handle]
+                    if capacity_left <= 0:
+                        continue
+                    chunk = min(remaining, capacity_left)
+                    if chunk <= 0:
+                        continue
+                    assignments[uid].append((chunk, handle))
+                    assigned_totals[handle] += chunk
+                    remaining -= chunk
+                    placed = True
+                    break
+
+            if not placed:
+                raise ValueError(f"Could not allocate Venmo requests for {uid} within limits.")
+
+    return {
+        "handle_totals": assigned_totals,
+        "assignments": assignments,
+        "active_handles": active_handles,
+        "total_cents": total_cents,
+    }
+
+
 # ====== CORE COMPUTE ======
 def compute(file_bytes: bytes, filename: str, current_group: List[str]):
     """
@@ -520,7 +660,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  /names\n\n"
             "Settles:\n"
             "  /settle\n"
-            "  /snap\n\n"
+            "  /snap\n"
+            "  /venmo\n\n"
             "AI only triggers if you type: Kenobi <message>"
         )
     )
@@ -684,6 +825,66 @@ async def snap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(say(msg))
 
 
+async def venmo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LATEST_FILE_BYTES, LATEST_FILE_NAME
+
+    if (not LATEST_FILE_BYTES or not LATEST_FILE_NAME) and REPORT_URL:
+        try:
+            LATEST_FILE_BYTES, LATEST_FILE_NAME = await fetch_report_bytes()
+        except Exception as e:
+            await update.message.reply_text(say(f"Couldn’t pull the report from the site: {e}"))
+            return
+
+    if not LATEST_FILE_BYTES or not LATEST_FILE_NAME:
+        await update.message.reply_text(say("Send the report file first (CSV/XLS/XLSX), or set REPORT_URL on Render."))
+        return
+
+    try:
+        data, err, _ = compute_settle_lists(LATEST_FILE_BYTES, LATEST_FILE_NAME)
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t read that report: {e}"))
+        return
+
+    if err:
+        await update.message.reply_text(say(err))
+        return
+
+    losers = data["losers"]
+    report_names = data.get("report_names") or {}
+
+    if not losers:
+        await update.message.reply_text(say("No losers this week (no balances < 0)."))
+        return
+
+    try:
+        allocation = allocate_venmo_requests(losers)
+    except Exception as e:
+        await update.message.reply_text(say(f"Couldn’t build Venmo split: {e}"))
+        return
+
+    msg = "Venmo Messages (copy & paste)\n\n"
+    msg += "Handle Totals:\n"
+    for handle in allocation["active_handles"]:
+        total_cents = allocation["handle_totals"].get(handle, 0)
+        msg += f"{handle}: ${cents_to_money_str(total_cents)}\n"
+
+    msg += "\nMessages:\n\n"
+
+    for uid, bal in losers:
+        uid_norm = normalize_id(uid)
+        display = build_display_name(uid_norm, report_names)
+        parts = allocation["assignments"].get(uid_norm, [])
+
+        if not parts:
+            continue
+
+        for cents, handle in parts:
+            msg += f"{display}\n"
+            msg += build_venmo_message(cents, handle) + "\n\n"
+
+    await update.message.reply_text(say(msg))
+
+
 # ---- Name commands ----
 async def cmd_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or len(context.args) < 2:
@@ -809,6 +1010,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(p in text for p in ["snap", "/snap", "snap messages", "snapchat"]):
         return await snap(update, context)
 
+    if any(p in text for p in ["venmo", "/venmo"]):
+        return await venmo(update, context)
+
     if text.startswith("players") or text.startswith("set players"):
         ids = extract_ids(text_raw)
         if not ids:
@@ -820,7 +1024,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(p in text for p in ["help", "instructions", "how do i use"]):
         return await start(update, context)
 
-    await update.message.reply_text(say("Try: ‘weekly report’, ‘settle’, ‘snap’, or ‘/players AIDN015 AIDN042’."))
+    await update.message.reply_text(say("Try: ‘weekly report’, ‘settle’, ‘snap’, ‘venmo’, or ‘/players AIDN015 AIDN042’."))
 
 
 # ====== FASTAPI LIFECYCLE + WEBHOOK ======
@@ -839,6 +1043,7 @@ async def startup():
     tg_app.add_handler(CommandHandler("weekly", weekly))
     tg_app.add_handler(CommandHandler("settle", settle))
     tg_app.add_handler(CommandHandler("snap", snap))
+    tg_app.add_handler(CommandHandler("venmo", venmo))
 
     tg_app.add_handler(CommandHandler("name", cmd_name))
     tg_app.add_handler(CommandHandler("name_get", cmd_name_get))
