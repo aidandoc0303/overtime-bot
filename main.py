@@ -556,21 +556,23 @@ def compute_settle_lists(file_bytes: bytes, filename: str):
 # Column B = Customer ID
 # Column D = Name
 # Column U = Zero Amt
-user_col = df.columns[1]   # B
-name_col = df.columns[3]   # D
-bal_col = df.columns[20]   # U
+    user_col = df.columns[1]   # B
+    name_col = df.columns[3]   # D
+    bal_col = df.columns[20]   # U
 
-if not user_col or not bal_col:
+    if not user_col or not bal_col:
         return None, None, "Couldn’t read columns B, D, and U from the sheet"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money).fillna(0)
 
     report_names: Dict[str, str] = {}
+
     if name_col:
         for _, r in df.iterrows():
             uid = str(r[user_col]).strip().upper()
             nm = str(r[name_col]).strip() if not pd.isna(r[name_col]) else ""
+
             if uid and nm:
                 report_names[uid] = nm
 
