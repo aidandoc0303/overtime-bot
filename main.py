@@ -559,7 +559,7 @@ def compute_settle_lists(file_bytes: bytes, filename: str):
 user_col = df.columns[1]   # B
 name_col = df.columns[3]   # D
 bal_col = df.columns[20]   # U
-    bal_col = (
+bal_col = (
         col_map.get("thisweek")
         or col_map.get("this week")
     )
