@@ -559,12 +559,8 @@ def compute_settle_lists(file_bytes: bytes, filename: str):
 user_col = df.columns[1]   # B
 name_col = df.columns[3]   # D
 bal_col = df.columns[20]   # U
-bal_col = (
-        col_map.get("thisweek")
-        or col_map.get("this week")
-    )
 
-    if not user_col or not bal_col:
+if not user_col or not bal_col:
         return None, None, "Couldn’t read columns B, D, and U from the sheet"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
