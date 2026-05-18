@@ -483,43 +483,28 @@ def allocate_venmo_requests(losers: List[Tuple[str, float]]) -> Dict[str, Any]:
 
 # ====== CORE COMPUTE ======
 def compute(file_bytes: bytes, filename: str, current_group: List[str]):
-    """
-    Returns:
-      group_total: float
-      per_player: Dict[uid, balance]
-      freeplay_total: int
-      breakdown: List[(uid, balance, freeplay)]
-      err: Optional[str]
-      used_cols: Dict[str,str]
-      report_names: Dict[uid, full_name]
-    """
     df = load_report_table(file_bytes, filename)
-    col_map = {normalize_col_name(c): c for c in df.columns}
 
-    user_col = col_map.get("id")
-    name_col = (
-        col_map.get("fullname")
-        or col_map.get("full name")
-        or col_map.get("name")
-    )
-    bal_col = (
-        col_map.get("thisweek")
-        or col_map.get("this week")
-    )
+    # New sheet format:
+    # Column B = Customer ID
+    # Column D = Name
+    # Column U = Zero Amt
+    if len(df.columns) <= 20:
+        return None, None, None, None, "Couldn’t read columns B, D, and U from the sheet", None, None
 
-    if not user_col or not bal_col:
-        return None, None, None, None, "Missing Id or ThisWeek column", None, None
+    user_col = df.columns[1]   # B
+    name_col = df.columns[3]   # D
+    bal_col = df.columns[20]   # U
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money)
 
     report_names: Dict[str, str] = {}
-    if name_col:
-        for _, r in df.iterrows():
-            uid = str(r[user_col]).strip().upper()
-            nm = str(r[name_col]).strip() if not pd.isna(r[name_col]) else ""
-            if uid and nm:
-                report_names[uid] = nm
+    for _, r in df.iterrows():
+        uid = str(r[user_col]).strip().upper()
+        nm = str(r[name_col]).strip() if not pd.isna(r[name_col]) else ""
+        if uid and nm:
+            report_names[uid] = nm
 
     selected = [normalize_id(u) for u in current_group]
     sub = df[df["_u"].isin(selected)].copy()
@@ -542,45 +527,44 @@ def compute(file_bytes: bytes, filename: str, current_group: List[str]):
 
     used_cols = {
         "user_col": str(user_col),
-        "name_col": str(name_col) if name_col else "",
+        "name_col": str(name_col),
         "bal_col": str(bal_col),
     }
+
     return group_total, per_player, freeplay_total, breakdown, None, used_cols, report_names
 
 
 def compute_settle_lists(file_bytes: bytes, filename: str):
     df = load_report_table(file_bytes, filename)
-    col_map = {normalize_col_name(c): c for c in df.columns}
 
     # New sheet format:
-# Column B = Customer ID
-# Column D = Name
-# Column U = Zero Amt
+    # Column B = Customer ID
+    # Column D = Name
+    # Column U = Zero Amt
+    if len(df.columns) <= 20:
+        return None, None, "Couldn’t read columns B, D, and U from the sheet"
+
     user_col = df.columns[1]   # B
     name_col = df.columns[3]   # D
     bal_col = df.columns[20]   # U
-
-    if not user_col or not bal_col:
-        return None, None, "Couldn’t read columns B, D, and U from the sheet"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money).fillna(0)
 
     report_names: Dict[str, str] = {}
-
-    if name_col:
-        for _, r in df.iterrows():
-            uid = str(r[user_col]).strip().upper()
-            nm = str(r[name_col]).strip() if not pd.isna(r[name_col]) else ""
-
-            if uid and nm:
-                report_names[uid] = nm
+    for _, r in df.iterrows():
+        uid = str(r[user_col]).strip().upper()
+        nm = str(r[name_col]).strip() if not pd.isna(r[name_col]) else ""
+        if uid and nm:
+            report_names[uid] = nm
 
     winners = []
     losers = []
+
     for _, r in df.iterrows():
         uid = str(r[user_col]).strip().upper()
         bal = float(r["_b"])
+
         if bal > 0:
             winners.append((uid, bal))
         elif bal < 0:
@@ -601,7 +585,7 @@ def compute_settle_lists(file_bytes: bytes, filename: str):
         "net": net,
         "used_cols": {
             "user_col": str(user_col),
-            "name_col": str(name_col) if name_col else "",
+            "name_col": str(name_col),
             "bal_col": str(bal_col),
         },
         "report_names": report_names,
