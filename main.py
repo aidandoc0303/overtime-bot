@@ -552,19 +552,20 @@ def compute_settle_lists(file_bytes: bytes, filename: str):
     df = load_report_table(file_bytes, filename)
     col_map = {normalize_col_name(c): c for c in df.columns}
 
-    user_col = col_map.get("id")
-    name_col = (
-        col_map.get("fullname")
-        or col_map.get("full name")
-        or col_map.get("name")
-    )
+    # New sheet format:
+# Column B = Customer ID
+# Column D = Name
+# Column U = Zero Amt
+user_col = df.columns[1]   # B
+name_col = df.columns[3]   # D
+bal_col = df.columns[20]   # U
     bal_col = (
         col_map.get("thisweek")
         or col_map.get("this week")
     )
 
     if not user_col or not bal_col:
-        return None, None, "Missing Id or ThisWeek column"
+        return None, None, "Couldn’t read columns B, D, and U from the sheet"
 
     df["_u"] = df[user_col].astype(str).str.strip().str.upper()
     df["_b"] = df[bal_col].apply(parse_money).fillna(0)
@@ -712,7 +713,7 @@ async def weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if used_cols:
         msg += f"Using columns: {used_cols.get('user_col')} + {used_cols.get('name_col')} + {used_cols.get('bal_col')}\n\n"
 
-    msg += "Selected Players (ThisWeek):\n"
+    msg += "Selected Players (Zero Amt):\n"
     for uid in CURRENT_GROUP:
         bal = float((per_player or {}).get(normalize_id(uid), 0.0))
         msg += f"{build_display_name(uid, report_names)}: {bal:,.2f}\n"
